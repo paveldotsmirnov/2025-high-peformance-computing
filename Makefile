@@ -52,6 +52,27 @@ runompgnu:
 	$(CC) -Ofast -fopenmp -std=gnu11 run.c  -lm  -o run
 	$(CC) -Ofast -fopenmp -std=gnu11 runq.c  -lm  -o runq
 
+# compiles with gprof profiling support (debug-friendly, better function visibility)
+# Usage: make runprof && ./run model.bin -n 100 && gprof run gmon.out > profile.txt
+.PHONY: runprof
+runprof: run.c
+	$(CC) -pg -g -O2 -fopenmp -march=native run.c -lm -o run
+	$(CC) -pg -g -O2 -fopenmp -march=native runq.c -lm -o runq
+
+# compiles with gprof profiling support (optimized, may inline some functions)
+# Usage: make runprofopt && ./run model.bin -n 100 && gprof run gmon.out > profile.txt
+.PHONY: runprofopt
+runprofopt: run.c
+	$(CC) -pg -O3 -fopenmp -march=native run.c -lm -o run
+	$(CC) -pg -O3 -fopenmp -march=native runq.c -lm -o runq
+
+# compiles with gprof profiling support (fastest, may lose some function details)
+# Usage: make runompprof && ./run model.bin -n 100 && gprof run gmon.out > profile.txt
+.PHONY: runompprof
+runompprof: run.c
+	$(CC) -pg -Ofast -fopenmp -march=native run.c -lm -o run
+	$(CC) -pg -Ofast -fopenmp -march=native runq.c -lm -o runq
+
 # run all tests
 .PHONY: test
 test:
@@ -74,3 +95,5 @@ testcc:
 clean:
 	rm -f run
 	rm -f runq
+	rm -f gmon.out
+	rm -f testc

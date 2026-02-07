@@ -1,4 +1,4 @@
-/* Inference for Llama-2 Transformer model in pure C */
+
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -220,7 +220,7 @@ void matmul(float* restrict xout,
             int n, int d)
 {
     int i;
-    #pragma omp for
+    #pragma omp for schedule(static) private(i)
     for (i = 0; i < d; i++) {
         float val = 0.0f;
         #pragma omp simd reduction(+:val)
@@ -243,24 +243,18 @@ float* forward(Transformer* transformer, int token, int pos) {
     int hidden_dim =  p->hidden_dim;
     int head_size = dim / p->n_heads;
 
-    // token embedding (sequenziale)
     float* content_row = w->token_embedding_table + token * dim;
     memcpy(x, content_row, dim*sizeof(*x));
 
-    // layers
     for (unsigned long long l = 0; l < p->n_layers; l++) {
 
-        // ---- SEQUENZIALE ----
         rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim);
 
         int loff = l * p->seq_len * kv_dim;
         s->k = s->key_cache + loff + pos * kv_dim;
         s->v = s->value_cache + loff + pos * kv_dim;
 
-        // =====================================================
-        // PARALLEL REGION (UNA SOLA)
-        // =====================================================
-        #pragma omp parallel
+        #pragma omp parallel shared(s, w, p, l, dim, kv_dim, kv_mul, head_size, loff, pos)
         {
             // qkv projections
             matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
@@ -269,7 +263,6 @@ float* forward(Transformer* transformer, int token, int pos) {
 
             #pragma omp single
             {
-                // RoPE (lasciata sequenziale per semplicità/correttezza)
                 for (int i = 0; i < dim; i+=2) {
                     int head_dim = i % head_size;
                     float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
@@ -287,9 +280,8 @@ float* forward(Transformer* transformer, int token, int pos) {
                 }
             }
 
-            // -------- ATTENTION --------
             int h;
-            #pragma omp for
+            #pragma omp for schedule(static) private(h) nowait
             for (h = 0; h < p->n_heads; h++) {
 
                 float* q = s->q + h * head_size;
@@ -323,17 +315,16 @@ float* forward(Transformer* transformer, int token, int pos) {
             matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
         } // end parallel region
 
-        // ---- SEQUENZIALE ----
         for (int i = 0; i < dim; i++) x[i] += s->xb2[i];
 
         rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim);
 
-        #pragma omp parallel
+        #pragma omp parallel shared(s, w, l, dim, hidden_dim)
         {
             matmul(s->hb,  s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
             matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
 
-            #pragma omp for
+            #pragma omp for schedule(static) nowait
             for (int i = 0; i < hidden_dim; i++) {
                 float val = s->hb[i];
                 val *= (1.0f / (1.0f + expf(-val)));
