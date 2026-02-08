@@ -182,6 +182,7 @@ void free_transformer(Transformer* t) {
 void rmsnorm(float* o, float* x, float* weight, int size) {
     // calculate sum of squares
     float ss = 0.0f;
+    #pragma omp parallel for reduction(+:ss)
     for (int j = 0; j < size; j++) {
         ss += x[j] * x[j];
     }
@@ -189,6 +190,7 @@ void rmsnorm(float* o, float* x, float* weight, int size) {
     ss += 1e-5f;
     ss = 1.0f / sqrtf(ss);
     // normalize and scale
+    #pragma omp parallel for schedule(static)
     for (int j = 0; j < size; j++) {
         o[j] = weight[j] * (ss * x[j]);
     }
@@ -197,6 +199,7 @@ void rmsnorm(float* o, float* x, float* weight, int size) {
 void softmax(float* x, int size) {
     // find max value (for numerical stability)
     float max_val = x[0];
+    #pragma omp parallel for reduction(max:max_val)
     for (int i = 1; i < size; i++) {
         if (x[i] > max_val) {
             max_val = x[i];
@@ -204,11 +207,13 @@ void softmax(float* x, int size) {
     }
     // exp and sum
     float sum = 0.0f;
+    #pragma omp parallel for reduction(+:sum)
     for (int i = 0; i < size; i++) {
         x[i] = expf(x[i] - max_val);
         sum += x[i];
     }
     // normalize
+    #pragma omp parallel for schedule(static)
     for (int i = 0; i < size; i++) {
         x[i] /= sum;
     }
@@ -263,6 +268,7 @@ float* forward(Transformer* transformer, int token, int pos) {
         matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
 
         // RoPE relative positional encoding: complex-valued rotate q and k in each head
+        #pragma omp parallel for schedule(static)
         for (int i = 0; i < dim; i+=2) {
             int head_dim = i % head_size;
             float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
@@ -293,6 +299,7 @@ float* forward(Transformer* transformer, int token, int pos) {
                 float* k = s->key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
                 // calculate the attention score as the dot product of q and k
                 float score = 0.0f;
+                #pragma omp simd reduction(+:score)
                 for (int i = 0; i < head_size; i++) {
                     score += q[i] * k[i];
                 }
@@ -313,6 +320,7 @@ float* forward(Transformer* transformer, int token, int pos) {
                 // get the attention weight for this timestep
                 float a = att[t];
                 // accumulate the weighted value into xb
+                #pragma omp simd
                 for (int i = 0; i < head_size; i++) {
                     xb[i] += a * v[i];
                 }
@@ -323,6 +331,7 @@ float* forward(Transformer* transformer, int token, int pos) {
         matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
 
         // residual connection back into x
+        #pragma omp parallel for schedule(static)
         for (int i = 0; i < dim; i++) {
             x[i] += s->xb2[i];
         }
@@ -336,6 +345,7 @@ float* forward(Transformer* transformer, int token, int pos) {
         matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
 
         // SwiGLU non-linearity
+        #pragma omp parallel for schedule(static)
         for (int i = 0; i < hidden_dim; i++) {
             float val = s->hb[i];
             // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
@@ -349,6 +359,7 @@ float* forward(Transformer* transformer, int token, int pos) {
         matmul(s->xb, s->hb, w->w2 + l*dim*hidden_dim, hidden_dim, dim);
 
         // residual connection
+        #pragma omp parallel for schedule(static)
         for (int i = 0; i < dim; i++) {
             x[i] += s->xb[i];
         }
@@ -592,12 +603,29 @@ int sample_argmax(float* probabilities, int n) {
     // return the index that has the highest probability
     int max_i = 0;
     float max_p = probabilities[0];
-    for (int i = 1; i < n; i++) {
-        if (probabilities[i] > max_p) {
-            max_i = i;
-            max_p = probabilities[i];
+
+    #pragma omp parallel
+    {
+        int local_max_i = 0;
+        float local_max_p = probabilities[0];
+        
+        #pragma omp for nowait
+        for (int i = 1; i < n; i++) {
+            if (probabilities[i] > local_max_p) {
+                local_max_i = i;
+                local_max_p = probabilities[i];
+            }
+        }
+        
+        #pragma omp critical
+        {
+            if (local_max_p > max_p) {
+                max_i = local_max_i;
+                max_p = local_max_p;
+            }
         }
     }
+
     return max_i;
 }
 
@@ -711,15 +739,20 @@ int sample_topp(float* probabilities, int n, float topp, ProbIndex* probindex, f
     int k = (int)(n0 * topp * 1.2f);  // Sort 20% more than needed
     if (k > n0) k = n0;
     
-    partial_qsort(probindex, n0, k);
-    
-    // Now finish with standard qsort on just the top k (much smaller!)
-    qsort(probindex, n0, sizeof(ProbIndex), compare);
+    // sort only what we need.
+    if (k < n0) {
+        partial_qsort(probindex, n0, k);
+        // FIX: Only sort the top k elements, not all n0!
+        qsort(probindex, k, sizeof(ProbIndex), compare);
+    } else {
+        // If k == n0, just sort everything
+        qsort(probindex, n0, sizeof(ProbIndex), compare);
+    }
 
     // truncate the list where cumulative probability exceeds topp
     float cumulative_prob = 0.0f;
-    int last_idx = n0 - 1; // in case of rounding errors consider all elements
-    for (int i = 0; i < n0; i++) {
+    int last_idx = k - 1; // in case of rounding errors consider all elements
+    for (int i = 0; i < k; i++) {
         cumulative_prob += probindex[i].prob;
         if (cumulative_prob > topp) {
             last_idx = i;
@@ -771,7 +804,10 @@ int sample(Sampler* sampler, float* logits) {
         next = sample_argmax(logits, sampler->vocab_size);
     } else {
         // apply the temperature to the logits
-        for (int q=0; q<sampler->vocab_size; q++) { logits[q] /= sampler->temperature; }
+        #pragma omp parallel for schedule(static)
+        for (int q=0; q<sampler->vocab_size; q++) { 
+            logits[q] /= sampler->temperature; 
+        }
         // apply softmax to the logits to get the probabilities for next token
         softmax(logits, sampler->vocab_size);
         // flip a (float) coin (this is our source of entropy for sampling)
