@@ -622,6 +622,34 @@ int compare(const void* a, const void* b) {
     return 0;
 }
 
+int partition(ProbIndex* arr, int low, int high) {
+    float pivot = arr[high].prob;
+    int i = low - 1;
+    for (int j = low; j < high; j++) {
+        if (arr[j].prob >= pivot) {  // >= for descending
+            i++;
+            ProbIndex temp = arr[i];
+            arr[i] = arr[j];
+            arr[j] = temp;
+        }
+    }
+    ProbIndex temp = arr[i + 1];
+    arr[i + 1] = arr[high];
+    arr[high] = temp;
+    return i + 1;
+}
+
+// Partial quicksort - only sort top k elements
+void partial_qsort(ProbIndex* arr, int n, int k) {
+    int low = 0, high = n - 1;
+    while (low < high) {
+        int pi = partition(arr, low, high);
+        if (pi == k) break;
+        else if (pi < k) low = pi + 1;
+        else high = pi - 1;
+    }
+}
+
 int sample_topp(float* probabilities, int n, float topp, ProbIndex* probindex, float coin) {
     // top-p sampling (or "nucleus sampling") samples from the smallest set of
     // tokens that exceed probability topp. This way we never sample tokens that
@@ -633,13 +661,59 @@ int sample_topp(float* probabilities, int n, float topp, ProbIndex* probindex, f
     // values smaller than (1 - topp) / (n - 1) cannot be part of the result
     // so for efficiency we crop these out as candidates before sorting
     const float cutoff = (1.0f - topp) / (n - 1);
-    for (int i = 0; i < n; i++) {
-        if (probabilities[i] >= cutoff) {
-            probindex[n0].index = i;
-            probindex[n0].prob = probabilities[i];
-            n0++;
+
+
+    // Parallel filtering with thread-local arrays
+    int num_threads = omp_get_max_threads();
+    int* offsets = calloc(num_threads + 1, sizeof(int));
+    ProbIndex** buffers = malloc(num_threads * sizeof(ProbIndex*));
+    
+    #pragma omp parallel
+    {
+        int tid = omp_get_thread_num();
+        buffers[tid] = malloc(n * sizeof(ProbIndex));
+        int count = 0;
+        
+        #pragma omp for schedule(static)
+        for (int i = 0; i < n; i++) {
+            if (probabilities[i] >= cutoff) {
+                buffers[tid][count].index = i;
+                buffers[tid][count].prob = probabilities[i];
+                count++;
+            }
         }
+        offsets[tid + 1] = count;
+        
+        #pragma omp barrier
+        
+        // Compute prefix sum
+        #pragma omp single
+        {
+            for (int t = 1; t <= num_threads; t++) {
+                offsets[t] += offsets[t - 1];
+            }
+            n0 = offsets[num_threads];
+        }
+        
+        // Merge into final array
+        int start = offsets[tid];
+        for (int i = 0; i < offsets[tid + 1] - offsets[tid]; i++) {
+            probindex[start + i] = buffers[tid][i];
+        }
+        
+        free(buffers[tid]);
     }
+    
+    free(buffers);
+    free(offsets);
+
+    // Estimate: we need roughly top-p fraction, but sort a bit more for safety
+    int k = (int)(n0 * topp * 1.2f);  // Sort 20% more than needed
+    if (k > n0) k = n0;
+    
+    partial_qsort(probindex, n0, k);
+    
+    // Now finish with standard qsort on just the top k (much smaller!)
     qsort(probindex, n0, sizeof(ProbIndex), compare);
 
     // truncate the list where cumulative probability exceeds topp
