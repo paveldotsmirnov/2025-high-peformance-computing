@@ -102,13 +102,13 @@ NVCC=$(CUDA_HOME)/bin/nvcc
 CXX=g++
 
 OPT:=-O2 -g
-NVOPT:=-Xcompiler -fopenmp -lineinfo -arch=sm_53 --ptxas-options=-v --use_fast_math -DUSE_CUDA
+NVOPT:=-Xcompiler "-fopenmp" -lineinfo -arch=sm_53 --ptxas-options=-v --use_fast_math -DUSE_CUDA
 
 CXXFLAGS:=$(OPT) -I. $(EXT_CXXFLAGS)
 LDFLAGS:=-lm -lcudart $(EXT_LDFLAGS)
 
 NVCFLAGS:=$(CXXFLAGS) $(NVOPT)
-NVLDFLAGS:=$(LDFLAGS) -lgomp
+NVLDFLAGS:=$(LDFLAGS) -Xlinker "-fopenmp" -lgomp
 
 .PHONY: runcuda
 runcuda: run.cu
