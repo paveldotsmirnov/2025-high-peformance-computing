@@ -108,7 +108,7 @@ CXXFLAGS:=$(OPT) -I. $(EXT_CXXFLAGS)
 LDFLAGS:=-lm -lcudart $(EXT_LDFLAGS)
 
 NVCFLAGS:=$(CXXFLAGS) $(NVOPT)
-NVLDFLAGS:=$(LDFLAGS) -Xlinker "-fopenmp" -lgomp
+NVLDFLAGS:=$(LDFLAGS) -Xcompiler "-fopenmp" -lgomp
 
 .PHONY: runcuda
 runcuda: run.cu
