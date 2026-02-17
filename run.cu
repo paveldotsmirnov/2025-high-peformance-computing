@@ -31,6 +31,10 @@ static inline void gpuAssert(cudaError_t code, const char *file, int line, bool 
             exit(code);
     }
 }
+
+// Forward declarations for CUDA kernels
+__global__ void accum_kernel(float* a, float* b, int size);
+__global__ void silu_mul_kernel(float* hb, float* hb2, int hidden_dim);
 #endif
 
 // ----------------------------------------------------------------------------
@@ -126,6 +130,27 @@ void transpose_weights_gpu(float* d_w, float* d_w_t, int n, int d) {
     transpose_kernel<<<blocksPerGrid, threadsPerBlock>>>(d_w, d_w_t, n, d);
     gpuErrchk(cudaPeekAtLastError());
     gpuErrchk(cudaDeviceSynchronize());
+}
+
+// GPU kernel for element-wise accumulation (residual connections)
+__global__ void accum_kernel(float* a, float* b, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        a[idx] += b[idx];
+    }
+}
+
+// GPU kernel for SwiGLU activation
+__global__ void silu_mul_kernel(float* hb, float* hb2, int hidden_dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < hidden_dim) {
+        float val = hb[idx];
+        // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
+        val *= (1.0f / (1.0f + expf(-val)));
+        // elementwise multiply with w3(x)
+        val *= hb2[idx];
+        hb[idx] = val;
+    }
 }
 #endif
 
@@ -597,9 +622,6 @@ float* forward(Transformer* transformer, int token, int pos) {
         matmul(s->q, s->xb, w->wq_t + l*qkv_dim_q*dim, dim, qkv_dim_q);
         matmul(s->k, s->xb, w->wk_t + l*kv_dim*dim, dim, kv_dim);
         matmul(s->v, s->xb, w->wv_t + l*kv_dim*dim, dim, kv_dim);
-        // Copy q, k back to host for RoPE (CPU operation)
-        gpuErrchk(cudaMemcpy(s->q, s->q, dim*sizeof(float), cudaMemcpyDeviceToHost));
-        gpuErrchk(cudaMemcpy(s->k, s->k, kv_dim*sizeof(float), cudaMemcpyDeviceToHost));
 #else
         matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
         matmul(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
@@ -657,13 +679,13 @@ float* forward(Transformer* transformer, int token, int pos) {
 #ifdef USE_CUDA
         // Transfer necessary data to host for CPU attention computation
         // This is a temporary solution - ideally should use GPU kernel
-        float* q_host = (float*)malloc(dim * sizeof(float));
+        float* q_host_att = (float*)malloc(dim * sizeof(float));
         float* att_host = (float*)malloc(p->n_heads * p->seq_len * sizeof(float));
         float* key_cache_host = (float*)malloc(p->n_layers * p->seq_len * kv_dim * sizeof(float));
         float* value_cache_host = (float*)malloc(p->n_layers * p->seq_len * kv_dim * sizeof(float));
         float* xb_host = (float*)malloc(dim * sizeof(float));
         
-        gpuErrchk(cudaMemcpy(q_host, s->q, dim * sizeof(float), cudaMemcpyDeviceToHost));
+        gpuErrchk(cudaMemcpy(q_host_att, s->q, dim * sizeof(float), cudaMemcpyDeviceToHost));
         gpuErrchk(cudaMemcpy(key_cache_host, s->key_cache, p->n_layers * p->seq_len * kv_dim * sizeof(float), cudaMemcpyDeviceToHost));
         gpuErrchk(cudaMemcpy(value_cache_host, s->value_cache, p->n_layers * p->seq_len * kv_dim * sizeof(float), cudaMemcpyDeviceToHost));
         memset(xb_host, 0, dim * sizeof(float));
@@ -672,7 +694,7 @@ float* forward(Transformer* transformer, int token, int pos) {
         #pragma omp parallel for private(h)
         for (h = 0; h < p->n_heads; h++) {
             // get the query vector for this head
-            float* q = q_host + h * head_size;
+            float* q = q_host_att + h * head_size;
             // attention scores for this head
             float* att = att_host + h * p->seq_len;
             // iterate over all timesteps, including the current one
@@ -713,7 +735,7 @@ float* forward(Transformer* transformer, int token, int pos) {
         gpuErrchk(cudaMemcpy(s->key_cache, key_cache_host, p->n_layers * p->seq_len * kv_dim * sizeof(float), cudaMemcpyHostToDevice));
         gpuErrchk(cudaMemcpy(s->value_cache, value_cache_host, p->n_layers * p->seq_len * kv_dim * sizeof(float), cudaMemcpyHostToDevice));
         
-        free(q_host);
+        free(q_host_att);
         free(att_host);
         free(key_cache_host);
         free(value_cache_host);
@@ -772,9 +794,9 @@ float* forward(Transformer* transformer, int token, int pos) {
         // residual connection back into x
 #ifdef USE_CUDA
         // Simple GPU kernel for element-wise addition
-        int threadsPerBlock = 256;
-        int blocksPerGrid = (dim + threadsPerBlock - 1) / threadsPerBlock;
-        accum_kernel<<<blocksPerGrid, threadsPerBlock>>>(x, s->xb2, dim);
+        int threadsPerBlock_acc = 256;
+        int blocksPerGrid_acc = (dim + threadsPerBlock_acc - 1) / threadsPerBlock_acc;
+        accum_kernel<<<blocksPerGrid_acc, threadsPerBlock_acc>>>(x, s->xb2, dim);
         gpuErrchk(cudaPeekAtLastError());
         gpuErrchk(cudaDeviceSynchronize());
 #else
