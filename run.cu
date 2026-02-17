@@ -424,6 +424,56 @@ void free_transformer(Transformer* t) {
 // ----------------------------------------------------------------------------
 // neural net blocks; the dynamics of the Transformer
 
+#ifdef USE_CUDA
+// Simple GPU kernel for rmsnorm - two pass approach
+__global__ void rmsnorm_sum_kernel(float* x, float* sum_out, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    float local_sum = 0.0f;
+    
+    // Each thread processes multiple elements
+    for (int i = idx; i < size; i += blockDim.x * gridDim.x) {
+        float val = x[i];
+        local_sum += val * val;
+    }
+    
+    // Atomic reduction
+    atomicAdd(sum_out, local_sum);
+}
+
+__global__ void rmsnorm_apply_kernel(float* o, float* x, float* weight, float norm_factor, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        o[idx] = weight[idx] * (norm_factor * x[idx]);
+    }
+}
+
+void rmsnorm(float* o, float* x, float* weight, int size) {
+    // First pass: calculate sum of squares
+    float* d_sum;
+    gpuErrchk(cudaMalloc((void**)&d_sum, sizeof(float)));
+    gpuErrchk(cudaMemset(d_sum, 0, sizeof(float)));
+    
+    int threadsPerBlock = 256;
+    int blocksPerGrid = (size + threadsPerBlock - 1) / threadsPerBlock;
+    rmsnorm_sum_kernel<<<blocksPerGrid, threadsPerBlock>>>(x, d_sum, size);
+    gpuErrchk(cudaPeekAtLastError());
+    gpuErrchk(cudaDeviceSynchronize());
+    
+    // Copy sum to host and calculate normalization factor
+    float sum;
+    gpuErrchk(cudaMemcpy(&sum, d_sum, sizeof(float), cudaMemcpyDeviceToHost));
+    gpuErrchk(cudaFree(d_sum));
+    
+    float ss = sum / size;
+    ss += 1e-5f;
+    ss = 1.0f / sqrtf(ss);
+    
+    // Second pass: apply normalization
+    rmsnorm_apply_kernel<<<blocksPerGrid, threadsPerBlock>>>(o, x, weight, ss, size);
+    gpuErrchk(cudaPeekAtLastError());
+    gpuErrchk(cudaDeviceSynchronize());
+}
+#else
 void rmsnorm(float* o, float* x, float* weight, int size) {
     // calculate sum of squares
     float ss = 0.0f;
@@ -440,6 +490,7 @@ void rmsnorm(float* o, float* x, float* weight, int size) {
         o[j] = weight[j] * (ss * x[j]);
     }
 }
+#endif
 
 void softmax(float* x, int size) {
     // find max value (for numerical stability)
@@ -603,6 +654,71 @@ float* forward(Transformer* transformer, int token, int pos) {
 #endif
 
         // multihead attention. iterate over all heads
+#ifdef USE_CUDA
+        // Transfer necessary data to host for CPU attention computation
+        // This is a temporary solution - ideally should use GPU kernel
+        float* q_host = (float*)malloc(dim * sizeof(float));
+        float* att_host = (float*)malloc(p->n_heads * p->seq_len * sizeof(float));
+        float* key_cache_host = (float*)malloc(p->n_layers * p->seq_len * kv_dim * sizeof(float));
+        float* value_cache_host = (float*)malloc(p->n_layers * p->seq_len * kv_dim * sizeof(float));
+        float* xb_host = (float*)malloc(dim * sizeof(float));
+        
+        gpuErrchk(cudaMemcpy(q_host, s->q, dim * sizeof(float), cudaMemcpyDeviceToHost));
+        gpuErrchk(cudaMemcpy(key_cache_host, s->key_cache, p->n_layers * p->seq_len * kv_dim * sizeof(float), cudaMemcpyDeviceToHost));
+        gpuErrchk(cudaMemcpy(value_cache_host, s->value_cache, p->n_layers * p->seq_len * kv_dim * sizeof(float), cudaMemcpyDeviceToHost));
+        memset(xb_host, 0, dim * sizeof(float));
+        
+        int h;
+        #pragma omp parallel for private(h)
+        for (h = 0; h < p->n_heads; h++) {
+            // get the query vector for this head
+            float* q = q_host + h * head_size;
+            // attention scores for this head
+            float* att = att_host + h * p->seq_len;
+            // iterate over all timesteps, including the current one
+            for (int t = 0; t <= pos; t++) {
+                // get the key vector for this head and at this timestep
+                float* k = key_cache_host + loff + t * kv_dim + (h / kv_mul) * head_size;
+                // calculate the attention score as the dot product of q and k
+                float score = 0.0f;
+                #pragma omp simd reduction(+:score)
+                for (int i = 0; i < head_size; i++) {
+                    score += q[i] * k[i];
+                }
+                score /= sqrtf(head_size);
+                // save the score to the attention buffer
+                att[t] = score;
+            }
+
+            // softmax the scores to get attention weights, from 0..pos inclusively
+            softmax(att, pos + 1);
+
+            // weighted sum of the values, store back into xb
+            float* xb = xb_host + h * head_size;
+            for (int t = 0; t <= pos; t++) {
+                // get the value vector for this head and at this timestep
+                float* v = value_cache_host + loff + t * kv_dim + (h / kv_mul) * head_size;
+                // get the attention weight for this timestep
+                float a = att[t];
+                // accumulate the weighted value into xb
+                #pragma omp simd
+                for (int i = 0; i < head_size; i++) {
+                    xb[i] += a * v[i];
+                }
+            }
+        }
+        
+        // Copy results back to device
+        gpuErrchk(cudaMemcpy(s->xb, xb_host, dim * sizeof(float), cudaMemcpyHostToDevice));
+        gpuErrchk(cudaMemcpy(s->key_cache, key_cache_host, p->n_layers * p->seq_len * kv_dim * sizeof(float), cudaMemcpyHostToDevice));
+        gpuErrchk(cudaMemcpy(s->value_cache, value_cache_host, p->n_layers * p->seq_len * kv_dim * sizeof(float), cudaMemcpyHostToDevice));
+        
+        free(q_host);
+        free(att_host);
+        free(key_cache_host);
+        free(value_cache_host);
+        free(xb_host);
+#else
         int h;
         #pragma omp parallel for private(h)
         for (h = 0; h < p->n_heads; h++) {
@@ -643,6 +759,7 @@ float* forward(Transformer* transformer, int token, int pos) {
                 }
             }
         }
+#endif
 
         // final matmul to get the output of the attention
 #ifdef USE_CUDA
@@ -653,10 +770,19 @@ float* forward(Transformer* transformer, int token, int pos) {
 #endif
 
         // residual connection back into x
+#ifdef USE_CUDA
+        // Simple GPU kernel for element-wise addition
+        int threadsPerBlock = 256;
+        int blocksPerGrid = (dim + threadsPerBlock - 1) / threadsPerBlock;
+        accum_kernel<<<blocksPerGrid, threadsPerBlock>>>(x, s->xb2, dim);
+        gpuErrchk(cudaPeekAtLastError());
+        gpuErrchk(cudaDeviceSynchronize());
+#else
         #pragma omp parallel for schedule(static)
         for (int i = 0; i < dim; i++) {
             x[i] += s->xb2[i];
         }
+#endif
 
         // ffn rmsnorm
         rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim);
@@ -672,6 +798,13 @@ float* forward(Transformer* transformer, int token, int pos) {
 #endif
 
         // SwiGLU non-linearity
+#ifdef USE_CUDA
+        int threadsPerBlock_silu = 256;
+        int blocksPerGrid_silu = (hidden_dim + threadsPerBlock_silu - 1) / threadsPerBlock_silu;
+        silu_mul_kernel<<<blocksPerGrid_silu, threadsPerBlock_silu>>>(s->hb, s->hb2, hidden_dim);
+        gpuErrchk(cudaPeekAtLastError());
+        gpuErrchk(cudaDeviceSynchronize());
+#else
         #pragma omp parallel for schedule(static)
         for (int i = 0; i < hidden_dim; i++) {
             float val = s->hb[i];
@@ -681,6 +814,7 @@ float* forward(Transformer* transformer, int token, int pos) {
             val *= s->hb2[i];
             s->hb[i] = val;
         }
+#endif
 
         // final matmul to get the output of the ffn
 #ifdef USE_CUDA
@@ -690,10 +824,18 @@ float* forward(Transformer* transformer, int token, int pos) {
 #endif
 
         // residual connection
+#ifdef USE_CUDA
+        int threadsPerBlock_res = 256;
+        int blocksPerGrid_res = (dim + threadsPerBlock_res - 1) / threadsPerBlock_res;
+        accum_kernel<<<blocksPerGrid_res, threadsPerBlock_res>>>(x, s->xb, dim);
+        gpuErrchk(cudaPeekAtLastError());
+        gpuErrchk(cudaDeviceSynchronize());
+#else
         #pragma omp parallel for schedule(static)
         for (int i = 0; i < dim; i++) {
             x[i] += s->xb[i];
         }
+#endif
     }
 
     // final rmsnorm
