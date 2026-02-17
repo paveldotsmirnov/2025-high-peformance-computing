@@ -91,9 +91,36 @@ testcc:
 	$(CC) -DVERBOSITY=$(VERBOSITY) -O3 -o testc test.c -lm
 	./testc
 
+# CUDA build for sm_53 architecture (matching lab style)
+ifndef CUDA_HOME
+CUDA_HOME:=/usr/local/cuda
+endif
+
+BUILD_DIR ?= ./build
+
+NVCC=$(CUDA_HOME)/bin/nvcc
+CXX=g++
+
+OPT:=-O2 -g
+NVOPT:=-Xcompiler -fopenmp -lineinfo -arch=sm_53 --ptxas-options=-v --use_fast_math -DUSE_CUDA
+
+CXXFLAGS:=$(OPT) -I. $(EXT_CXXFLAGS)
+LDFLAGS:=-lm -lcudart $(EXT_LDFLAGS)
+
+NVCFLAGS:=$(CXXFLAGS) $(NVOPT)
+NVLDFLAGS:=$(LDFLAGS) -lgomp
+
+.PHONY: runcuda
+runcuda: run.cu
+	$(MKDIR_P) $(BUILD_DIR)
+	$(NVCC) $(NVCFLAGS) run.cu -o run $(NVLDFLAGS)
+
 .PHONY: clean
 clean:
 	rm -f run
 	rm -f runq
 	rm -f gmon.out
 	rm -f testc
+	rm -fr $(BUILD_DIR) *.exe *.out *~
+
+MKDIR_P ?= mkdir -p
