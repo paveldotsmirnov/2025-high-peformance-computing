@@ -143,7 +143,7 @@ void malloc_run_state(RunState* s, Config* p) {
     gpuErrchk(cudaMalloc((void**)&s->value_cache, p->n_layers * p->seq_len * kv_dim * sizeof(float)));
     gpuErrchk(cudaMalloc((void**)&s->att, p->n_heads * p->seq_len * sizeof(float)));
     // logits stays on host for CPU sampling
-    s->logits = calloc(p->vocab_size, sizeof(float));
+    s->logits = (float*)calloc(p->vocab_size, sizeof(float));
     if (!s->logits) {
         fprintf(stderr, "malloc failed for logits!\n");
         exit(EXIT_FAILURE);
@@ -247,7 +247,7 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weigh
     // memory map the Transformer weights into the data pointer
     *fd = open(checkpoint, O_RDONLY); // open in read only mode
     if (*fd == -1) { fprintf(stderr, "open failed!\n"); exit(EXIT_FAILURE); }
-    *data = mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0);
+    *data = (float*)mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0);
     if (*data == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); exit(EXIT_FAILURE); }
     float* weights_ptr = *data + sizeof(Config)/sizeof(float);
     
@@ -542,8 +542,8 @@ float* forward(Transformer* transformer, int token, int pos) {
 
         // qkv matmuls for this position
 #ifdef USE_CUDA
-        int qkv_dim = p->n_heads * head_size;
-        matmul(s->q, s->xb, w->wq_t + l*qkv_dim*dim, dim, qkv_dim);
+        int qkv_dim_q = p->n_heads * head_size;
+        matmul(s->q, s->xb, w->wq_t + l*qkv_dim_q*dim, dim, qkv_dim_q);
         matmul(s->k, s->xb, w->wk_t + l*kv_dim*dim, dim, kv_dim);
         matmul(s->v, s->xb, w->wv_t + l*kv_dim*dim, dim, kv_dim);
         // Copy q, k back to host for RoPE (CPU operation)
@@ -646,8 +646,8 @@ float* forward(Transformer* transformer, int token, int pos) {
 
         // final matmul to get the output of the attention
 #ifdef USE_CUDA
-        int qkv_dim = p->n_heads * head_size;
-        matmul(s->xb2, s->xb, w->wo_t + l*dim*qkv_dim, dim, dim);
+        int qkv_dim_wo = p->n_heads * head_size;
+        matmul(s->xb2, s->xb, w->wo_t + l*dim*qkv_dim_wo, dim, dim);
 #else
         matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
 #endif
@@ -798,7 +798,7 @@ void safe_printf(char *piece) {
 int str_lookup(char *str, TokenIndex *sorted_vocab, int vocab_size) {
     // efficiently find the perfect match for str in vocab, return its index or -1 if not found
     TokenIndex tok = { .str = str }; // acts as the key to search for
-    TokenIndex *res = bsearch(&tok, sorted_vocab, vocab_size, sizeof(TokenIndex), compare_tokens);
+    TokenIndex *res = (TokenIndex *)bsearch(&tok, sorted_vocab, vocab_size, sizeof(TokenIndex), compare_tokens);
     return res != NULL ? res->id : -1;
 }
 
@@ -809,7 +809,7 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
 
     if (t->sorted_vocab == NULL) {
         // lazily malloc and sort the vocabulary
-        t->sorted_vocab = malloc(t->vocab_size * sizeof(TokenIndex));
+        t->sorted_vocab = (TokenIndex *)malloc(t->vocab_size * sizeof(TokenIndex));
         for (int i = 0; i < t->vocab_size; i++) {
             t->sorted_vocab[i].str = t->vocab[i];
             t->sorted_vocab[i].id = i;
@@ -819,7 +819,7 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
 
     // create a temporary buffer that will store merge candidates of always two consecutive tokens
     // *2 for concat, +1 for null terminator +2 for UTF8 (in case max_token_length is 1)
-    char* str_buffer = malloc((t->max_token_length*2 +1 +2) * sizeof(char));
+    char* str_buffer = (char*)malloc((t->max_token_length*2 +1 +2) * sizeof(char));
     size_t str_len = 0;
 
     // start at 0 tokens
@@ -833,7 +833,7 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
     // TODO: pretty sure this isn't correct in the general case but I don't have the
     // energy to read more of the sentencepiece code to figure out what it's doing
     if (text[0] != '\0') {
-        int dummy_prefix = str_lookup(" ", t->sorted_vocab, t->vocab_size);
+        int dummy_prefix = str_lookup((char*)" ", t->sorted_vocab, t->vocab_size);
         tokens[(*n_tokens)++] = dummy_prefix;
     }
 
@@ -1033,14 +1033,48 @@ int sample_topp(float* probabilities, int n, float topp, ProbIndex* probindex, f
 
 
     // Parallel filtering with thread-local arrays
+#ifdef USE_CUDA
+    // OpenMP not available in CUDA mode, use single-threaded version
+    int num_threads = 1;
+    int* offsets = (int*)calloc(num_threads + 1, sizeof(int));
+    ProbIndex** buffers = (ProbIndex**)malloc(num_threads * sizeof(ProbIndex*));
+    buffers[0] = (ProbIndex*)malloc(n * sizeof(ProbIndex));
+    int tid = 0;
+    int count = 0;
+    
+    for (int i = 0; i < n; i++) {
+        if (probabilities[i] >= cutoff) {
+            buffers[tid][count].index = i;
+            buffers[tid][count].prob = probabilities[i];
+            count++;
+        }
+    }
+    offsets[tid + 1] = count;
+    
+    // Compute prefix sum
+    for (int t = 1; t <= num_threads; t++) {
+        offsets[t] += offsets[t - 1];
+    }
+    n0 = offsets[num_threads];
+    
+    // Merge into final array
+    int start = offsets[tid];
+    for (int i = 0; i < offsets[tid + 1] - offsets[tid]; i++) {
+        probindex[start + i] = buffers[tid][i];
+    }
+    
+    free(buffers[tid]);
+    free(buffers);
+    free(offsets);
+#else
     int num_threads = omp_get_max_threads();
-    int* offsets = calloc(num_threads + 1, sizeof(int));
-    ProbIndex** buffers = malloc(num_threads * sizeof(ProbIndex*));
+    int* offsets = (int*)calloc(num_threads + 1, sizeof(int));
+    ProbIndex** buffers = (ProbIndex**)malloc(num_threads * sizeof(ProbIndex*));
     
     #pragma omp parallel
     {
         int tid = omp_get_thread_num();
-        buffers[tid] = malloc(n * sizeof(ProbIndex));
+        buffers[tid] = (ProbIndex*)malloc(n * sizeof(ProbIndex));
         int count = 0;
         
         #pragma omp for schedule(static)
@@ -1075,6 +1109,7 @@ int sample_topp(float* probabilities, int n, float topp, ProbIndex* probindex, f
     
     free(buffers);
     free(offsets);
+#endif
 
     // Estimate: we need roughly top-p fraction, but sort a bit more for safety
     int k = (int)(n0 * topp * 1.2f);  // Sort 20% more than needed
@@ -1267,7 +1302,6 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
     int8_t user_turn = 1; // user starts
     int next;        // will store the next token in the sequence
     int token;       // stores the current token to feed into the transformer
-    int prev_token;
     int pos = 0;     // position in the sequence
     while (pos < steps) {
 
@@ -1359,13 +1393,13 @@ int main(int argc, char *argv[]) {
 
     // default parameters
     char *checkpoint_path = NULL;  // e.g. out/model.bin
-    char *tokenizer_path = "tokenizer.bin";
+    char *tokenizer_path = (char*)"tokenizer.bin";
     float temperature = 1.0f;   // 0.0 = greedy deterministic. 1.0 = original. don't set higher
     float topp = 0.9f;          // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
     int steps = 256;            // number of steps to run for
     char *prompt = NULL;        // prompt string
     unsigned long long rng_seed = 0; // seed rng with time by default
-    char *mode = "generate";    // generate|chat
+    char *mode = (char*)"generate";    // generate|chat
     char *system_prompt = NULL; // the (optional) system prompt to use in chat mode
 
     // poor man's C argparse so we can override the defaults above from the command line
