@@ -115,6 +115,10 @@ runcuda: run.cu
 	$(MKDIR_P) $(BUILD_DIR)
 	$(NVCC) $(NVCFLAGS) run.cu -o run $(NVLDFLAGS)
 
+.PHONY: profile
+profile: run
+	nvprof ./run stories15M.bin -n 256
+
 .PHONY: clean
 clean:
 	rm -f run
