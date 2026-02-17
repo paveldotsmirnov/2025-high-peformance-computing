@@ -1,1 +1,4 @@
 *.bin
+.md
+material/
+build/
