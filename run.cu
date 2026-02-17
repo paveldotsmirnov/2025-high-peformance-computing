@@ -1197,40 +1197,7 @@ int sample_topp(float* probabilities, int n, float topp, ProbIndex* probindex, f
 
 
     // Parallel filtering with thread-local arrays
-#ifdef USE_CUDA
-    // OpenMP not available in CUDA mode, use single-threaded version
-    int num_threads = 1;
-    int* offsets = (int*)calloc(num_threads + 1, sizeof(int));
-    ProbIndex** buffers = (ProbIndex**)malloc(num_threads * sizeof(ProbIndex*));
-    buffers[0] = (ProbIndex*)malloc(n * sizeof(ProbIndex));
-    int tid = 0;
-    int count = 0;
-    
-    for (int i = 0; i < n; i++) {
-        if (probabilities[i] >= cutoff) {
-            buffers[tid][count].index = i;
-            buffers[tid][count].prob = probabilities[i];
-            count++;
-        }
-    }
-    offsets[tid + 1] = count;
-    
-    // Compute prefix sum
-    for (int t = 1; t <= num_threads; t++) {
-        offsets[t] += offsets[t - 1];
-    }
-    n0 = offsets[num_threads];
-    
-    // Merge into final array
-    int start = offsets[tid];
-    for (int i = 0; i < offsets[tid + 1] - offsets[tid]; i++) {
-        probindex[start + i] = buffers[tid][i];
-    }
-    
-    free(buffers[tid]);
-    free(buffers);
-    free(offsets);
-#else
+    // Note: OpenMP is available even in CUDA mode for CPU-side operations like sampling
     int num_threads = omp_get_max_threads();
     int* offsets = (int*)calloc(num_threads + 1, sizeof(int));
     ProbIndex** buffers = (ProbIndex**)malloc(num_threads * sizeof(ProbIndex*));
@@ -1273,7 +1240,6 @@ int sample_topp(float* probabilities, int n, float topp, ProbIndex* probindex, f
     
     free(buffers);
     free(offsets);
-#endif
 
     // Estimate: we need roughly top-p fraction, but sort a bit more for safety
     int k = (int)(n0 * topp * 1.2f);  // Sort 20% more than needed
