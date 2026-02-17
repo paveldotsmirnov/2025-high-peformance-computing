@@ -1,4 +1,5 @@
 *.bin
-.md
+!tokenizer.bin
+*.md
 material/
 build/
