@@ -99,6 +99,7 @@ endif
 BUILD_DIR ?= ./build
 
 NVCC=$(CUDA_HOME)/bin/nvcc
+NVPROF=$(CUDA_HOME)/bin/nvprof
 CXX=g++
 
 OPT:=-O2 -g
@@ -117,7 +118,7 @@ runcuda: run.cu
 
 .PHONY: profile
 profile: runcuda
-	nvprof ./run stories15M.bin -n 256
+	$(NVPROF) ./run stories15M.bin -n 256
 
 .PHONY: clean
 clean:
