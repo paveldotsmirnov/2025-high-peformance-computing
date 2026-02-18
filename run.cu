@@ -35,6 +35,14 @@ static inline void gpuAssert(cudaError_t code, const char *file, int line, bool 
 // Forward declarations for CUDA kernels
 __global__ void accum_kernel(float* a, float* b, int size);
 __global__ void silu_mul_kernel(float* hb, float* hb2, int hidden_dim);
+__global__ void rope_kernel(float* q, float* k, int dim, int kv_dim, int head_size, int pos);
+__global__ void attention_scores_kernel(float* att, const float* q, const float* key_cache, 
+                                         int n_heads, int head_size, int kv_dim, int kv_mul,
+                                         int seq_len, int pos, int loff);
+__global__ void softmax_kernel(float* x, int size, float max_val, float sum);
+__global__ void attention_weighted_sum_kernel(float* xb, const float* att, const float* value_cache,
+                                               int n_heads, int head_size, int kv_dim, int kv_mul,
+                                               int seq_len, int pos, int loff);
 #endif
 
 // ----------------------------------------------------------------------------
@@ -150,6 +158,106 @@ __global__ void silu_mul_kernel(float* hb, float* hb2, int hidden_dim) {
         // elementwise multiply with w3(x)
         val *= hb2[idx];
         hb[idx] = val;
+    }
+}
+
+// GPU kernel for RoPE (Rotary Positional Encoding)
+__global__ void rope_kernel(float* q, float* k, int dim, int kv_dim, int head_size, int pos) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int pair_idx = idx * 2;  // Process pairs of elements
+    
+    if (pair_idx < dim) {
+        int head_dim = pair_idx % head_size;
+        float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
+        float val = pos * freq;
+        float fcr = cosf(val);
+        float fci = sinf(val);
+        
+        // Rotate q
+        float q0 = q[pair_idx];
+        float q1 = q[pair_idx + 1];
+        q[pair_idx] = q0 * fcr - q1 * fci;
+        q[pair_idx + 1] = q0 * fci + q1 * fcr;
+        
+        // Rotate k if within kv_dim
+        if (pair_idx < kv_dim) {
+            float k0 = k[pair_idx];
+            float k1 = k[pair_idx + 1];
+            k[pair_idx] = k0 * fcr - k1 * fci;
+            k[pair_idx + 1] = k0 * fci + k1 * fcr;
+        }
+    }
+}
+
+// GPU kernel to compute attention scores for all heads and timesteps
+__global__ void attention_scores_kernel(float* att, const float* q, const float* key_cache, 
+                                         int n_heads, int head_size, int kv_dim, int kv_mul,
+                                         int seq_len, int pos, int loff) {
+    int head_idx = blockIdx.x;
+    int timestep = blockIdx.y;
+    
+    if (head_idx < n_heads && timestep <= pos) {
+        // Get query vector for this head
+        const float* q_head = q + head_idx * head_size;
+        
+        // Get key vector for this head and timestep
+        int kv_head_idx = head_idx / kv_mul;
+        const float* k = key_cache + loff + timestep * kv_dim + kv_head_idx * head_size;
+        
+        // Compute dot product
+        float score = 0.0f;
+        for (int i = 0; i < head_size; i++) {
+            score += q_head[i] * k[i];
+        }
+        score /= sqrtf((float)head_size);
+        
+        // Store score
+        att[head_idx * seq_len + timestep] = score;
+    }
+}
+
+// GPU kernel for softmax (assumes max_val and sum are already computed)
+__global__ void softmax_kernel(float* x, int size, float max_val, float sum) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        x[idx] = expf(x[idx] - max_val) / sum;
+    }
+}
+
+// GPU kernel for weighted sum of values
+__global__ void attention_weighted_sum_kernel(float* xb, const float* att, const float* value_cache,
+                                               int n_heads, int head_size, int kv_dim, int kv_mul,
+                                               int seq_len, int pos, int loff) {
+    int head_idx = blockIdx.x;
+    int head_dim_idx = threadIdx.x;
+    
+    if (head_idx < n_heads && head_dim_idx < head_size) {
+        float* xb_head = xb + head_idx * head_size;
+        int kv_head_idx = head_idx / kv_mul;
+        
+        // Accumulate weighted values
+        float sum = 0.0f;
+        for (int t = 0; t <= pos; t++) {
+            float a = att[head_idx * seq_len + t];
+            const float* v = value_cache + loff + t * kv_dim + kv_head_idx * head_size;
+            sum += a * v[head_dim_idx];
+        }
+        xb_head[head_dim_idx] = sum;
+    }
+}
+
+// Reduction kernels for softmax
+__global__ void max_reduce_kernel(const float* x, float* max_val, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        atomicMax((unsigned int*)max_val, __float_as_uint(fmaxf(x[idx], __uint_as_float(*((unsigned int*)max_val)))));
+    }
+}
+
+__global__ void sum_reduce_kernel(float* x, float* sum_val, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        atomicAdd(sum_val, x[idx]);
     }
 }
 #endif
@@ -583,6 +691,40 @@ void matmul(float* xout, float* x, float* w, int n, int d) {
 #endif
 }
 
+#ifdef USE_CUDA
+// GPU softmax helper function for a single head's attention scores
+// For small sizes (seq_len), use host-based approach for simplicity
+// This is acceptable since we're doing it per-head and seq_len is typically small
+void softmax_gpu(float* x, int size) {
+    float* x_host = (float*)malloc(size * sizeof(float));
+    gpuErrchk(cudaMemcpy(x_host, x, size * sizeof(float), cudaMemcpyDeviceToHost));
+    
+    // Find max
+    float max_val = x_host[0];
+    for (int i = 1; i < size; i++) {
+        if (x_host[i] > max_val) {
+            max_val = x_host[i];
+        }
+    }
+    
+    // Exp and sum
+    float sum = 0.0f;
+    for (int i = 0; i < size; i++) {
+        x_host[i] = expf(x_host[i] - max_val);
+        sum += x_host[i];
+    }
+    
+    // Normalize
+    for (int i = 0; i < size; i++) {
+        x_host[i] /= sum;
+    }
+    
+    // Copy back
+    gpuErrchk(cudaMemcpy(x, x_host, size * sizeof(float), cudaMemcpyHostToDevice));
+    free(x_host);
+}
+#endif
+
 float* forward(Transformer* transformer, int token, int pos) {
 
     // a few convenience variables
@@ -630,32 +772,12 @@ float* forward(Transformer* transformer, int token, int pos) {
 
         // RoPE relative positional encoding: complex-valued rotate q and k in each head
 #ifdef USE_CUDA
-        // Copy q, k to host for CPU RoPE operation
-        float* q_host = (float*)malloc(dim * sizeof(float));
-        float* k_host = (float*)malloc(kv_dim * sizeof(float));
-        gpuErrchk(cudaMemcpy(q_host, s->q, dim*sizeof(float), cudaMemcpyDeviceToHost));
-        gpuErrchk(cudaMemcpy(k_host, s->k, kv_dim*sizeof(float), cudaMemcpyDeviceToHost));
-        #pragma omp parallel for schedule(static)
-        for (int i = 0; i < dim; i+=2) {
-            int head_dim = i % head_size;
-            float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
-            float val = pos * freq;
-            float fcr = cosf(val);
-            float fci = sinf(val);
-            int rotn = i < kv_dim ? 2 : 1; // how many vectors? 2 = q & k, 1 = q only
-            for (int v = 0; v < rotn; v++) {
-                float* vec = v == 0 ? q_host : k_host; // the vector to rotate (query or key)
-                float v0 = vec[i];
-                float v1 = vec[i+1];
-                vec[i]   = v0 * fcr - v1 * fci;
-                vec[i+1] = v0 * fci + v1 * fcr;
-            }
-        }
-        // Copy back to GPU
-        gpuErrchk(cudaMemcpy(s->q, q_host, dim*sizeof(float), cudaMemcpyHostToDevice));
-        gpuErrchk(cudaMemcpy(s->k, k_host, kv_dim*sizeof(float), cudaMemcpyHostToDevice));
-        free(q_host);
-        free(k_host);
+        // GPU RoPE computation
+        int threadsPerBlock_rope = 256;
+        int blocksPerGrid_rope = ((dim / 2) + threadsPerBlock_rope - 1) / threadsPerBlock_rope;
+        rope_kernel<<<blocksPerGrid_rope, threadsPerBlock_rope>>>(s->q, s->k, dim, kv_dim, head_size, pos);
+        gpuErrchk(cudaPeekAtLastError());
+        gpuErrchk(cudaDeviceSynchronize());
 #else
         #pragma omp parallel for schedule(static)
         for (int i = 0; i < dim; i+=2) {
@@ -677,69 +799,34 @@ float* forward(Transformer* transformer, int token, int pos) {
 
         // multihead attention. iterate over all heads
 #ifdef USE_CUDA
-        // Transfer necessary data to host for CPU attention computation
-        // This is a temporary solution - ideally should use GPU kernel
-        float* q_host_att = (float*)malloc(dim * sizeof(float));
-        float* att_host = (float*)malloc(p->n_heads * p->seq_len * sizeof(float));
-        float* key_cache_host = (float*)malloc(p->n_layers * p->seq_len * kv_dim * sizeof(float));
-        float* value_cache_host = (float*)malloc(p->n_layers * p->seq_len * kv_dim * sizeof(float));
-        float* xb_host = (float*)malloc(dim * sizeof(float));
+        // GPU attention computation
+        // Initialize xb to zero
+        gpuErrchk(cudaMemset(s->xb, 0, dim * sizeof(float)));
         
-        gpuErrchk(cudaMemcpy(q_host_att, s->q, dim * sizeof(float), cudaMemcpyDeviceToHost));
-        gpuErrchk(cudaMemcpy(key_cache_host, s->key_cache, p->n_layers * p->seq_len * kv_dim * sizeof(float), cudaMemcpyDeviceToHost));
-        gpuErrchk(cudaMemcpy(value_cache_host, s->value_cache, p->n_layers * p->seq_len * kv_dim * sizeof(float), cudaMemcpyDeviceToHost));
-        memset(xb_host, 0, dim * sizeof(float));
+        // Compute attention scores for all heads and timesteps
+        dim3 grid_att(p->n_heads, pos + 1);
+        attention_scores_kernel<<<grid_att, 1>>>(s->att, s->q, s->key_cache, 
+                                                  p->n_heads, head_size, kv_dim, kv_mul,
+                                                  p->seq_len, pos, loff);
+        gpuErrchk(cudaPeekAtLastError());
+        gpuErrchk(cudaDeviceSynchronize());
         
-        int h;
-        #pragma omp parallel for private(h)
-        for (h = 0; h < p->n_heads; h++) {
-            // get the query vector for this head
-            float* q = q_host_att + h * head_size;
-            // attention scores for this head
-            float* att = att_host + h * p->seq_len;
-            // iterate over all timesteps, including the current one
-            for (int t = 0; t <= pos; t++) {
-                // get the key vector for this head and at this timestep
-                float* k = key_cache_host + loff + t * kv_dim + (h / kv_mul) * head_size;
-                // calculate the attention score as the dot product of q and k
-                float score = 0.0f;
-                #pragma omp simd reduction(+:score)
-                for (int i = 0; i < head_size; i++) {
-                    score += q[i] * k[i];
-                }
-                score /= sqrtf(head_size);
-                // save the score to the attention buffer
-                att[t] = score;
-            }
+        // Apply softmax per head
+        for (int h = 0; h < p->n_heads; h++) {
+            float* att_head = s->att + h * p->seq_len;
+            softmax_gpu(att_head, pos + 1);
 
-            // softmax the scores to get attention weights, from 0..pos inclusively
-            softmax(att, pos + 1);
-
-            // weighted sum of the values, store back into xb
-            float* xb = xb_host + h * head_size;
-            for (int t = 0; t <= pos; t++) {
-                // get the value vector for this head and at this timestep
-                float* v = value_cache_host + loff + t * kv_dim + (h / kv_mul) * head_size;
-                // get the attention weight for this timestep
-                float a = att[t];
-                // accumulate the weighted value into xb
-                #pragma omp simd
-                for (int i = 0; i < head_size; i++) {
-                    xb[i] += a * v[i];
-                }
-            }
         }
         
-        // Copy results back to device
-        gpuErrchk(cudaMemcpy(s->xb, xb_host, dim * sizeof(float), cudaMemcpyHostToDevice));
-        gpuErrchk(cudaMemcpy(s->key_cache, key_cache_host, p->n_layers * p->seq_len * kv_dim * sizeof(float), cudaMemcpyHostToDevice));
-        gpuErrchk(cudaMemcpy(s->value_cache, value_cache_host, p->n_layers * p->seq_len * kv_dim * sizeof(float), cudaMemcpyHostToDevice));
+        // Compute weighted sum of values
+        dim3 grid_sum(p->n_heads, 1);
+        dim3 block_sum(head_size, 1);
+        attention_weighted_sum_kernel<<<grid_sum, block_sum>>>(s->xb, s->att, s->value_cache,
+                                                                p->n_heads, head_size, kv_dim, kv_mul,
+                                                                p->seq_len, pos, loff);
+        gpuErrchk(cudaPeekAtLastError());
+        gpuErrchk(cudaDeviceSynchronize());
         
-        free(q_host_att);
-        free(att_host);
-        free(key_cache_host);
-        free(value_cache_host);
-        free(xb_host);
 #else
         int h;
         #pragma omp parallel for private(h)
