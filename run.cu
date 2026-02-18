@@ -105,9 +105,6 @@ typedef struct {
     // kv cache
     float* key_cache;   // (layer, seq_len, dim)
     float* value_cache; // (layer, seq_len, dim)
-#ifdef USE_CUDA
-    float* rmsnorm_sum_buffer; // Pre-allocated buffer for RMSNorm reduction
-#endif
 } RunState;
 
 typedef struct {
@@ -249,57 +246,18 @@ __global__ void attention_weighted_sum_kernel(float* xb, const float* att, const
     }
 }
 
-// GPU softmax kernel for small arrays (seq_len) - uses single block with strided access
-__global__ void softmax_kernel_simple(float* x, int size) {
-    extern __shared__ float sdata[];
-    int tid = threadIdx.x;
-    
-    // Step 1: Find max - each thread processes its element
-    float max_val = -INFINITY;
-    for (int i = tid; i < size; i += blockDim.x) {
-        max_val = fmaxf(max_val, x[i]);
+// Reduction kernels for softmax
+__global__ void max_reduce_kernel(const float* x, float* max_val, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        atomicMax((unsigned int*)max_val, __float_as_uint(fmaxf(x[idx], __uint_as_float(*((unsigned int*)max_val)))));
     }
-    
-    sdata[tid] = max_val;
-    __syncthreads();
-    
-    // Reduction to find global max
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
-        }
-        __syncthreads();
-    }
-    
-    float global_max = sdata[0];
-    __syncthreads();
-    
-    // Step 2: Compute exp(x - max) and accumulate sum
-    float local_sum = 0.0f;
-    for (int i = tid; i < size; i += blockDim.x) {
-        float val = expf(x[i] - global_max);
-        x[i] = val;
-        local_sum += val;
-    }
-    
-    sdata[tid] = local_sum;
-    __syncthreads();
-    
-    // Sum reduction
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            sdata[tid] += sdata[tid + s];
-        }
-        __syncthreads();
-    }
-    
-    float global_sum = sdata[0];
-    
-    // Step 3: Normalize
-    if (global_sum > 0.0f) {
-        for (int i = tid; i < size; i += blockDim.x) {
-            x[i] /= global_sum;
-        }
+}
+
+__global__ void sum_reduce_kernel(float* x, float* sum_val, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        atomicAdd(sum_val, x[idx]);
     }
 }
 #endif
@@ -317,8 +275,6 @@ void malloc_run_state(RunState* s, Config* p) {
     gpuErrchk(cudaMalloc((void**)&s->key_cache, p->n_layers * p->seq_len * kv_dim * sizeof(float)));
     gpuErrchk(cudaMalloc((void**)&s->value_cache, p->n_layers * p->seq_len * kv_dim * sizeof(float)));
     gpuErrchk(cudaMalloc((void**)&s->att, p->n_heads * p->seq_len * sizeof(float)));
-    // Pre-allocate RMSNorm reduction buffer
-    gpuErrchk(cudaMalloc((void**)&s->rmsnorm_sum_buffer, sizeof(float)));
     // logits stays on host for CPU sampling
     s->logits = (float*)calloc(p->vocab_size, sizeof(float));
     if (!s->logits) {
@@ -358,7 +314,6 @@ void free_run_state(RunState* s) {
     gpuErrchk(cudaFree(s->hb2));
     gpuErrchk(cudaFree(s->q));
     gpuErrchk(cudaFree(s->att));
-    gpuErrchk(cudaFree(s->rmsnorm_sum_buffer));
     free(s->logits);
     gpuErrchk(cudaFree(s->key_cache));
     gpuErrchk(cudaFree(s->value_cache));
@@ -625,8 +580,10 @@ __global__ void rmsnorm_apply_kernel(float* o, float* x, float* weight, float no
     }
 }
 
-void rmsnorm(float* o, float* x, float* weight, int size, float* d_sum) {
-    // First pass: calculate sum of squares using pre-allocated buffer
+void rmsnorm(float* o, float* x, float* weight, int size) {
+    // First pass: calculate sum of squares
+    float* d_sum;
+    gpuErrchk(cudaMalloc((void**)&d_sum, sizeof(float)));
     gpuErrchk(cudaMemset(d_sum, 0, sizeof(float)));
     
     int threadsPerBlock = 256;
@@ -638,6 +595,7 @@ void rmsnorm(float* o, float* x, float* weight, int size, float* d_sum) {
     // Copy sum to host and calculate normalization factor
     float sum;
     gpuErrchk(cudaMemcpy(&sum, d_sum, sizeof(float), cudaMemcpyDeviceToHost));
+    gpuErrchk(cudaFree(d_sum));
     
     float ss = sum / size;
     ss += 1e-5f;
@@ -735,21 +693,35 @@ void matmul(float* xout, float* x, float* w, int n, int d) {
 
 #ifdef USE_CUDA
 // GPU softmax helper function for a single head's attention scores
-// Uses GPU kernel with shared memory for efficient reduction
+// For small sizes (seq_len), use host-based approach for simplicity
+// This is acceptable since we're doing it per-head and seq_len is typically small
 void softmax_gpu(float* x, int size) {
-    // Use single block with enough threads to handle the size
-    // The kernel uses strided access, so we can use a fixed number of threads
-    int threadsPerBlock = 256;  // Fixed thread count, kernel handles strided access
-    if (size < threadsPerBlock) {
-        threadsPerBlock = size;  // Use fewer threads if size is smaller
+    float* x_host = (float*)malloc(size * sizeof(float));
+    gpuErrchk(cudaMemcpy(x_host, x, size * sizeof(float), cudaMemcpyDeviceToHost));
+    
+    // Find max
+    float max_val = x_host[0];
+    for (int i = 1; i < size; i++) {
+        if (x_host[i] > max_val) {
+            max_val = x_host[i];
+        }
     }
     
-    int blocksPerGrid = 1;  // Single block
-    size_t sharedMemSize = threadsPerBlock * sizeof(float);
+    // Exp and sum
+    float sum = 0.0f;
+    for (int i = 0; i < size; i++) {
+        x_host[i] = expf(x_host[i] - max_val);
+        sum += x_host[i];
+    }
     
-    softmax_kernel_simple<<<blocksPerGrid, threadsPerBlock, sharedMemSize>>>(x, size);
-    gpuErrchk(cudaPeekAtLastError());
-    gpuErrchk(cudaDeviceSynchronize());
+    // Normalize
+    for (int i = 0; i < size; i++) {
+        x_host[i] /= sum;
+    }
+    
+    // Copy back
+    gpuErrchk(cudaMemcpy(x, x_host, size * sizeof(float), cudaMemcpyHostToDevice));
+    free(x_host);
 }
 #endif
 
@@ -779,11 +751,7 @@ float* forward(Transformer* transformer, int token, int pos) {
     for(unsigned long long l = 0; l < p->n_layers; l++) {
 
         // attention rmsnorm
-#ifdef USE_CUDA
-        rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim, s->rmsnorm_sum_buffer);
-#else
         rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim);
-#endif
 
         // key and value point to the kv cache
         int loff = l * p->seq_len * kv_dim; // kv cache layer offset for convenience
@@ -926,11 +894,7 @@ float* forward(Transformer* transformer, int token, int pos) {
 #endif
 
         // ffn rmsnorm
-#ifdef USE_CUDA
-        rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim, s->rmsnorm_sum_buffer);
-#else
         rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim);
-#endif
 
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
         // first calculate self.w1(x) and self.w3(x)
@@ -984,11 +948,7 @@ float* forward(Transformer* transformer, int token, int pos) {
     }
 
     // final rmsnorm
-#ifdef USE_CUDA
-    rmsnorm(x, x, w->rms_final_weight, dim, s->rmsnorm_sum_buffer);
-#else
     rmsnorm(x, x, w->rms_final_weight, dim);
-#endif
 
     // classifier into logits
 #ifdef USE_CUDA
